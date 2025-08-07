@@ -435,6 +435,8 @@ module.exports.uploading = function(state, emit) {
   const progress = state.transfer.progressRatio;
   const progressPercent = percent(progress);
   const archive = state.archive;
+  const speedInfo = state.transfer.speed;
+
   return html`
     <send-upload-area
       id="${archive.id}"
@@ -448,8 +450,13 @@ module.exports.uploading = function(state, emit) {
           expiresAt: Date.now() + 500 + state.archive.timeLimit * 1000
         })}
       </div>
-      <div class="link-primary text-sm font-medium mt-2">
-        ${progressPercent}
+      <div class="flex justify-between w-full mt-2">
+        <div class="link-primary text-sm font-medium">
+          ${progressPercent}
+        </div>
+        <div class="text-sm font-medium text-grey-70 dark:text-grey-40">
+          ${speedInfo.formatted}
+        </div>
       </div>
       <progress class="my-3" value="${progress}">${progressPercent}</progress>
       <button
@@ -631,13 +638,20 @@ module.exports.downloading = function(state) {
   const archive = state.fileInfo;
   const progress = state.transfer.progressRatio;
   const progressPercent = percent(progress);
+  const speedInfo = state.transfer.speed;
+
   return html`
     <send-archive
       class="flex flex-col bg-white rounded-default shadow-light p-4 w-full max-w-sm md:w-128 dark:bg-grey-90"
     >
       ${archiveInfo(archive)}
-      <div class="link-primary text-sm font-medium mt-2">
-        ${progressPercent}
+      <div class="flex justify-between w-full mt-2">
+        <div class="link-primary text-sm font-medium">
+          ${progressPercent}
+        </div>
+        <div class="text-sm font-medium text-grey-70 dark:text-grey-40">
+          ${speedInfo.formatted}
+        </div>
       </div>
       <progress class="my-3" value="${progress}">${progressPercent}</progress>
     </send-archive>

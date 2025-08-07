@@ -60,18 +60,18 @@ export function parseNonce(header) {
 async function fetchWithAuth(url, params, keychain) {
   const result = {};
   params = params || {};
-  const h = await keychain.authHeader();
-  params.headers = new Headers({
-    Authorization: h,
-    'Content-Type': 'application/json'
-  });
-  const response = await fetch(url, params);
-  result.response = response;
-  result.ok = response.ok;
-  const nonce = parseNonce(response.headers.get('WWW-Authenticate'));
-  result.shouldRetry = response.status === 401 && nonce !== keychain.nonce;
-  keychain.nonce = nonce;
-  return result;
+      const h = await keychain.authHeader();
+      params.headers = new Headers({
+        Authorization: h,
+        'Content-Type': 'application/json'
+      });
+    const response = await fetch(url, params);
+    result.response = response;
+    result.ok = response.ok;
+    const nonce = parseNonce(response.headers.get('WWW-Authenticate'));
+    result.shouldRetry = response.status === 401 && nonce !== keychain.nonce;
+    keychain.nonce = nonce;
+    return result;
 }
 
 async function fetchWithAuthAndRetry(url, params, keychain) {
@@ -119,24 +119,43 @@ export async function fileInfo(id, owner_token) {
 }
 
 export async function metadata(id, keychain) {
-  const result = await fetchWithAuthAndRetry(
-    getApiUrl(`/api/metadata/${id}`),
-    { method: 'GET' },
-    keychain
-  );
-  if (result.ok) {
-    const data = await result.response.json();
-    const meta = await keychain.decryptMetadata(b64ToArray(data.metadata));
-    return {
-      size: meta.size,
-      ttl: data.ttl,
-      iv: meta.iv,
-      name: meta.name,
-      type: meta.type,
-      manifest: meta.manifest
-    };
-  }
-  throw new Error(result.response.status);
+    const result = await fetchWithAuthAndRetry(
+      getApiUrl(`/api/metadata/${id}`),
+      { method: 'GET' },
+      keychain
+    );
+    if (result.ok) {
+      const data = await result.response.json();
+      // Handle case where metadata might be an object instead of base64 string
+      let metadataBytes;
+      if (typeof data.metadata === 'string') {
+        metadataBytes = b64ToArray(data.metadata);
+      } else if (typeof data.metadata === 'object' && data.metadata !== null) {
+        // If it's already an object, just return it with the ttl
+        return {
+          size: data.metadata.size,
+          ttl: data.ttl,
+          iv: data.metadata.iv,
+          name: data.metadata.name,
+          type: data.metadata.type,
+          manifest: data.metadata.manifest
+        };
+      } else {
+        throw new Error('Invalid metadata format - neither string nor object');
+      }
+
+      const meta = await keychain.decryptMetadata(metadataBytes);
+
+      return {
+        size: meta.size,
+        ttl: data.ttl,
+        iv: meta.iv,
+        name: meta.name,
+        type: meta.type,
+        manifest: meta.manifest
+      };
+    }
+    throw new Error(result.response.status);
 }
 
 export async function setPassword(id, owner_token, keychain) {
