@@ -68,6 +68,8 @@ export default function(state, emitter) {
     try {
       state.storage.remove(ownedFile.id);
       await ownedFile.del();
+
+      await checkFiles();
     } catch (e) {
       state.sentry.captureException(e);
     }
@@ -211,12 +213,61 @@ export default function(state, emitter) {
 
   emitter.on('getMetadata', async () => {
     const file = state.fileInfo;
+    console.log('📥 Getting metadata for file:', file && file.id);
 
-    const receiver = new FileReceiver(file);
+    if (!file || !file.secretKey || !file.nonce) {
+      console.error('💥 Invalid file info for FileReceiver:', file);
+      return emitter.emit('pushState', '/error');
+    }
+
+    let receiver;
     try {
-      await receiver.getMetadata();
+      receiver = new FileReceiver(file);
+    } catch (constructorError) {
+      console.error('💥 Failed to create FileReceiver:', constructorError);
+      return emitter.emit('pushState', '/error');
+    }
+
+    try {
+      // Try to get metadata with retry for DOMExceptions
+      let lastError;
+      let attempts = 0;
+      const maxAttempts = 3;
+
+      while (attempts < maxAttempts) {
+        try {
+          await receiver.getMetadata();
+          break; // Success, exit retry loop
+        } catch (metaError) {
+          lastError = metaError;
+          attempts++;
+
+          console.warn(`⚠️ Metadata attempt ${attempts} failed:`, metaError.message);
+
+          // If it's a DOMException or network error, retry after a delay
+          if (metaError instanceof DOMException ||
+              metaError.message.includes('network') ||
+              metaError.message.includes('Connection error')) {
+
+            if (attempts < maxAttempts) {
+              await new Promise(resolve => setTimeout(resolve, attempts * 1000));
+              continue;
+            }
+          }
+
+          // For other errors, don't retry
+          throw metaError;
+        }
+      }
+
+      // If we exhausted all attempts, throw the last error
+      if (attempts >= maxAttempts) {
+        throw lastError;
+      }
+
       state.transfer = receiver;
     } catch (e) {
+      console.error('💥 Failed to get metadata after retries:', e);
       if (e.message === '401' || e.message === '404') {
         file.password = null;
         if (!file.requiresPassword) {
@@ -232,18 +283,58 @@ export default function(state, emitter) {
   });
 
   emitter.on('download', async () => {
-    state.transfer.on('progress', updateProgress);
-    state.transfer.on('decrypting', render);
-    state.transfer.on('complete', render);
-    const links = openLinksInNewTab();
+    // Check if transfer object exists
+    if (!state.transfer) {
+      console.error('💥 Transfer object is null/undefined');
+      emitter.emit('pushState', '/error');
+      return;
+    }
+
+    // Check if transfer object has required methods
+    if (typeof state.transfer.on !== 'function' || typeof state.transfer.download !== 'function') {
+      console.error('💥 Transfer object is missing required methods');
+      emitter.emit('pushState', '/error');
+      return;
+    }
+
     try {
-      const dl = state.transfer.download({
-        stream: state.capabilities.streamDownload
-      });
-      render();
-      await dl;
+      state.transfer.on('progress', updateProgress);
+      state.transfer.on('decrypting', render);
+      state.transfer.on('complete', render);
+    } catch (eventError) {
+      console.error('💥 Failed to set up transfer event listeners:', eventError);
+      emitter.emit('pushState', '/error');
+      return;
+    }
+
+    const links = openLinksInNewTab();
+
+    try {
+      // Try stream download first, fallback to blob download if it fails
+      let downloadOptions = { stream: state.capabilities.streamDownload };
+      console.log(`📱 Download method: ${downloadOptions.stream ? 'Stream Download' : 'Blob Download'}`);
+
+      try {
+        const dl = state.transfer.download(downloadOptions);
+        render();
+        await dl;
+      } catch (streamError) {
+        console.warn('⚠️ Stream download failed, falling back to blob download:', streamError);
+
+        // Reset transfer state for retry
+        state.transfer.reset();
+
+        // Try blob download as fallback
+        const dl = state.transfer.download({ stream: false });
+        render();
+        await dl;
+      }
+
       state.storage.totalDownloads += 1;
       faviconProgressbar.updateFavicon(0);
+
+      // Force refresh the file list to update download counts and expiry status
+      await checkFiles();
     } catch (err) {
       if (err.message === '0') {
         // download cancelled
@@ -251,6 +342,8 @@ export default function(state, emitter) {
         render();
       } else {
         // eslint-disable-next-line no-console
+        console.error('💥 Download failed:', err);
+
         state.transfer = null;
         const location = err.message === '404' ? '/404' : '/error';
         if (location === '/error') {
@@ -258,6 +351,8 @@ export default function(state, emitter) {
             scope.setExtra('duration', err.duration);
             scope.setExtra('size', err.size);
             scope.setExtra('progress', err.progress);
+            scope.setExtra('errorMessage', err.message);
+            scope.setExtra('stackTrace', err.stack);
             state.sentry.captureException(err);
           });
         }

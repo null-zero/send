@@ -110,6 +110,10 @@ module.exports = function(app) {
   app.get('/api/filelist/:id([\\w-]{16})', auth.fxa, filelist.get);
   app.post('/api/filelist/:id([\\w-]{16})', auth.fxa, filelist.post);
   app.post('/api/upload', auth.fxa, require('./upload'));
+
+  // Standard chunked upload routes (for large files)
+  app.use('/api/upload/chunked', require('./chunkedUploadRoutes'));
+
   app.post(`/api/delete/:id${ID_REGEX}`, auth.owner, require('./delete'));
   app.post(`/api/password/:id${ID_REGEX}`, auth.owner, require('./password'));
   app.post(
@@ -119,6 +123,7 @@ module.exports = function(app) {
     require('./params')
   );
   app.post(`/api/info/:id${ID_REGEX}`, auth.owner, require('./info'));
+
   app.get('/__version__', function(req, res) {
     // eslint-disable-next-line node/no-missing-require
     res.sendFile(require.resolve('../../dist/version.json'));
