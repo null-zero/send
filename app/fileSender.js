@@ -1,9 +1,8 @@
 import Nanobus from 'nanobus';
 import OwnedFile from './ownedFile';
 import Keychain from './keychain';
-import { arrayToB64, bytes } from './utils';
+import { arrayToB64, bytes, encryptedSize } from './utils';
 import { uploadWs } from './api';
-import { encryptedSize } from './utils';
 
 // Import the chunked uploader (renamed from enterprise)
 class ChunkedUploader {
@@ -21,11 +20,13 @@ class ChunkedUploader {
       onError: config.onError || (() => {})
     };
 
+    this.originalFileSize = config.originalFileSize || 0; // Store original file size
     this.uploadId = null;
     this.fileId = null;
     this.totalChunks = 0;
     this.uploadedChunks = 0;
     this.uploadedSize = 0;
+    this.actualUploadedSize = 0; // Track actual uploaded bytes for progress
     this.metrics = {
       startTime: 0,
       chunkTimes: [],
@@ -42,92 +43,154 @@ class ChunkedUploader {
     }
     // Fallback for older browsers
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-      const r = Math.random() * 16 | 0;
-      const v = c == 'x' ? r : (r & 0x3 | 0x8);
+      const r = (Math.random() * 16) | 0;
+      const v = c == 'x' ? r : (r & 0x3) | 0x8;
       return v.toString(16);
     });
   }
 
-  async uploadChunked(encryptedStream, metadata, authKey, timeLimit, dlimit, bearerToken) {
+  async uploadChunked(
+    encryptedStream,
+    metadata,
+    authKey,
+    timeLimit,
+    dlimit,
+    bearerToken
+  ) {
     this.metrics.startTime = Date.now();
 
-    try {
-      // Convert stream to array buffer
-      const chunks = [];
-      const reader = encryptedStream.getReader();
-      let done = false;
+    // Initialize chunked upload session first
+    const initResponse = await this.initializeUpload(
+      metadata,
+      authKey,
+      timeLimit,
+      dlimit,
+      bearerToken
+    );
 
-      while (!done) {
-        const result = await reader.read();
-        done = result.done;
-        if (!done) {
-          chunks.push(result.value);
-        }
-      }
+    if (this.cancelled) {
+      throw new Error('Upload cancelled');
+    }
 
-      const fullData = new Uint8Array(chunks.reduce((acc, chunk) => acc + chunk.length, 0));
-      let offset = 0;
-      for (const chunk of chunks) {
-        fullData.set(chunk, offset);
-        offset += chunk.length;
-      }
+    this.uploadId = initResponse.uploadId;
+    this.fileId = initResponse.id;
 
-      // Calculate total chunks needed and store file size
-      this.fileSize = fullData.length; // Store the actual encrypted file size
-      this.totalChunks = Math.ceil(this.fileSize / this.config.chunkSize);
+    // Stream chunks directly without loading entire file into memory
+    const reader = encryptedStream.getReader();
+    let done = false;
+    let chunkIndex = 0;
+    let totalSize = 0;
+    const activeUploads = new Map(); // Track active uploads
 
-      // Initialize chunked upload session
-      const initResponse = await this.initializeUpload(metadata, authKey, timeLimit, dlimit, bearerToken);
-
+    while (!done) {
+      // Check for cancellation
       if (this.cancelled) {
         throw new Error('Upload cancelled');
       }
 
-      this.uploadId = initResponse.uploadId;
-      this.fileId = initResponse.id;
+      // Read chunks up to our buffer limit
+      const chunkBuffer = [];
+      let bufferSize = 0;
 
-      // Upload chunks
-      const chunkPromises = [];
-      for (let i = 0; i < this.totalChunks; i++) {
-        const start = i * this.config.chunkSize;
-        const end = Math.min(start + this.config.chunkSize, fullData.length);
-        const chunkData = fullData.slice(start, end);
+      // Fill buffer up to chunk size or until stream is done
+      while (!done && bufferSize < this.config.chunkSize) {
+        const result = await reader.read();
+        done = result.done;
 
-        chunkPromises.push(this.uploadChunk(i, chunkData, bearerToken));
-
-        // Limit parallel uploads
-        if (chunkPromises.length >= this.config.maxParallelChunks || i === this.totalChunks - 1) {
-          await Promise.all(chunkPromises);
-          chunkPromises.length = 0;
-        }
-
-        if (this.cancelled) {
-          throw new Error('Upload cancelled');
+        if (!done) {
+          chunkBuffer.push(result.value);
+          bufferSize += result.value.length;
         }
       }
 
-      // Finalize upload
-      await this.finalizeUpload(bearerToken);
+      if (chunkBuffer.length > 0) {
+        // Combine buffer into chunk
+        const chunkData = new Uint8Array(bufferSize);
+        let offset = 0;
+        for (const chunk of chunkBuffer) {
+          chunkData.set(chunk, offset);
+          offset += chunk.length;
+        }
 
-      return {
-        id: this.fileId,
-        url: initResponse.url,
-        ownerToken: initResponse.ownerToken,
-        duration: Date.now() - this.metrics.startTime
-      };
-    } catch (error) {
-      this.config.onError(error);
-      throw error;
+        totalSize += chunkData.length;
+
+        // Upload chunk with concurrency control
+        const chunkSize = chunkData.length;
+        const uploadPromise = this.uploadChunk(
+          chunkIndex,
+          chunkData,
+          bearerToken
+        ).then(result => {
+          this.actualUploadedSize += chunkSize;
+          // Use the estimated total size from initialization for more accurate progress
+          const estimatedTotal =
+            this.originalFileSize > 0
+              ? encryptedSize(this.originalFileSize)
+              : totalSize;
+          const progressTotal = Math.max(estimatedTotal, totalSize);
+          this.config.onProgress(this.actualUploadedSize, progressTotal);
+          return result;
+        });
+
+        activeUploads.set(chunkIndex, uploadPromise);
+
+        // Control concurrency - wait for oldest uploads to complete
+        if (activeUploads.size >= this.config.maxParallelChunks) {
+          const oldestIndex = Math.min(...activeUploads.keys());
+          await activeUploads.get(oldestIndex);
+          activeUploads.delete(oldestIndex);
+        }
+
+        chunkIndex++;
+      }
     }
+
+    // Wait for all remaining uploads to complete
+    await Promise.all(activeUploads.values());
+
+    this.totalChunks = chunkIndex;
+    this.fileSize = totalSize;
+
+    // Report final progress as 100% using actual uploaded size
+    this.config.onProgress(this.actualUploadedSize, this.actualUploadedSize);
+
+    // Handle case of empty file
+    if (this.totalChunks === 0) {
+      console.warn('No chunks uploaded - file may be empty');
+      throw new Error('No data to upload - file appears to be empty');
+    }
+
+    // Finalize the upload
+    const finalizeResponse = await this.finalizeUpload(bearerToken);
+
+    if (this.cancelled) {
+      throw new Error('Upload cancelled');
+    }
+
+    this.metrics.endTime = Date.now();
+    const duration = this.metrics.endTime - this.metrics.startTime;
+
+    return {
+      id: this.fileId,
+      url:
+        finalizeResponse.url ||
+        `${window.location.origin}/download/${this.fileId}/`,
+      ownerToken: finalizeResponse.ownerToken,
+      duration: duration
+    };
   }
 
   async initializeUpload(metadata, authKey, timeLimit, dlimit, bearerToken) {
-    // Create fileMetadata object with the actual file size
+    // Create fileMetadata object - estimate size from original file size
     // Convert encrypted metadata ArrayBuffer to base64 string (like WebSocket upload does)
     const metadataHeader = arrayToB64(new Uint8Array(metadata));
 
+    // Estimate encrypted size if we have original file size
+    const estimatedSize =
+      this.originalFileSize > 0 ? encryptedSize(this.originalFileSize) : 0;
+
     const fileMetadata = {
-      size: this.fileSize, // Use the encrypted file size
+      size: estimatedSize, // Use estimated encrypted size
       metadata: metadataHeader, // Store the encrypted metadata as base64 string
       name: 'chunked-file', // Placeholder name
       type: 'application/octet-stream'
@@ -137,7 +200,7 @@ class ChunkedUploader {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${bearerToken}`,
+        Authorization: `Bearer ${bearerToken}`,
         'X-Session-ID': this.config.sessionId
       },
       body: JSON.stringify({
@@ -157,8 +220,15 @@ class ChunkedUploader {
     });
 
     if (!response.ok) {
-      const error = await response.json();
-      throw new Error(`Init failed: ${error.error}`);
+      const errorText = await response.text();
+      try {
+        const error = JSON.parse(errorText);
+        throw new Error(
+          `Init failed: ${error.error || error.message || errorText}`
+        );
+      } catch (parseError) {
+        throw new Error(`Init failed: ${errorText}`);
+      }
     }
 
     return await response.json();
@@ -170,7 +240,10 @@ class ChunkedUploader {
     // Calculate hash if integrity verification is enabled
     let chunkHash = null;
     if (this.config.enableIntegrityVerification) {
-      const hashBuffer = await crypto.subtle.digest(this.config.hashAlgorithm, chunkData);
+      const hashBuffer = await crypto.subtle.digest(
+        this.config.hashAlgorithm,
+        chunkData
+      );
       chunkHash = btoa(String.fromCharCode(...new Uint8Array(hashBuffer)));
     }
 
@@ -183,7 +256,7 @@ class ChunkedUploader {
             'X-Session-ID': this.config.sessionId,
             'X-Upload-ID': this.uploadId,
             'X-Chunk-Index': chunkIndex.toString(),
-            'X-Total-Chunks': this.totalChunks.toString(),
+            'X-Total-Chunks': (this.totalChunks || 0).toString(), // Use 0 if not known yet
             'X-Chunk-Hash': chunkHash,
             'X-Hash-Algorithm': this.config.hashAlgorithm,
             'Content-Type': 'application/octet-stream'
@@ -192,28 +265,31 @@ class ChunkedUploader {
         });
 
         if (!response.ok) {
-          throw new Error(`Chunk ${chunkIndex} upload failed: ${response.statusText}`);
+          throw new Error(
+            `Chunk ${chunkIndex} upload failed: ${response.statusText}`
+          );
         }
 
         const result = await response.json();
 
-        // Update progress
-        this.uploadedChunks = result.receivedChunks;
-        this.uploadedSize += chunkData.length;
+        // Update progress (but don't call this.config.onProgress here as it's handled in the main loop)
+        this.uploadedChunks = result.receivedChunks || this.uploadedChunks + 1;
 
         const chunkTime = Date.now() - chunkStart;
         this.metrics.chunkTimes.push(chunkTime);
 
-        // Notify progress
-        this.config.onProgress(this.uploadedSize, this.getTotalSize());
+        // Notify chunk completion
         this.config.onChunkComplete(chunkIndex, chunkData.length, chunkTime);
 
         return result;
-
       } catch (error) {
         retries++;
         this.metrics.totalRetries++;
-        this.metrics.errors.push({ chunkIndex, error: error.message, retry: retries });
+        this.metrics.errors.push({
+          chunkIndex,
+          error: error.message,
+          retry: retries
+        });
 
         if (retries > this.config.maxRetries) {
           throw error;
@@ -252,7 +328,9 @@ class ChunkedUploader {
         metrics: {
           clientProcessingTime: Date.now() - this.metrics.startTime,
           totalRetries: this.metrics.totalRetries,
-          averageChunkTime: this.metrics.chunkTimes.reduce((a, b) => a + b, 0) / this.metrics.chunkTimes.length
+          averageChunkTime:
+            this.metrics.chunkTimes.reduce((a, b) => a + b, 0) /
+            this.metrics.chunkTimes.length
         }
       })
     });
@@ -336,7 +414,8 @@ export default class FileSender extends Nanobus {
     const timeDelta = now - this.lastProgressTime;
     const bytesDelta = currentBytes - this.lastProgressBytes;
 
-    if (timeDelta >= 500) { // Update speed every 500ms
+    if (timeDelta >= 500) {
+      // Update speed every 500ms
       const instantSpeed = (bytesDelta / timeDelta) * 1000; // bytes per second
 
       // Keep a rolling average of the last 10 speed samples
@@ -346,7 +425,9 @@ export default class FileSender extends Nanobus {
       }
 
       // Calculate average speed from samples
-      this.currentSpeed = this.speedSamples.reduce((sum, speed) => sum + speed, 0) / this.speedSamples.length;
+      this.currentSpeed =
+        this.speedSamples.reduce((sum, speed) => sum + speed, 0) /
+        this.speedSamples.length;
 
       this.lastProgressTime = now;
       this.lastProgressBytes = currentBytes;
@@ -396,15 +477,18 @@ export default class FileSender extends Nanobus {
     if (useChunkedUpload) {
       // Use chunked upload for large files
       this.chunkedUploader = new ChunkedUploader({
+        originalFileSize: archive.size, // Pass the original file size
         onProgress: (uploaded, total) => {
           this.progress = [uploaded, total];
           this.calculateSpeed(uploaded);
           this.emit('progress');
         },
         onChunkComplete: (chunkIndex, chunkSize, duration) => {
-          console.log(`Chunk ${chunkIndex} uploaded: ${chunkSize} bytes in ${duration}ms`);
+          console.log(
+            `Chunk ${chunkIndex} uploaded: ${chunkSize} bytes in ${duration}ms`
+          );
         },
-        onError: (error) => {
+        onError: error => {
           console.error('Chunked upload error:', error);
         }
       });
@@ -448,13 +532,11 @@ export default class FileSender extends Nanobus {
         });
 
         return ownedFile;
-
       } catch (e) {
         this.msg = 'errorPageHeader';
         this.chunkedUploader = null;
         throw e;
       }
-
     } else {
       // Use traditional WebSocket upload for smaller files
       this.uploadRequest = uploadWs(
@@ -503,7 +585,6 @@ export default class FileSender extends Nanobus {
         });
 
         return ownedFile;
-
       } catch (e) {
         this.msg = 'errorPageHeader';
         this.uploadRequest = null;
