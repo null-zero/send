@@ -31,6 +31,10 @@
     "test-integration": "cross-env NODE_ENV=development wdio test/wdio.docker.conf.js",
     "circleci-test-integration": "echo 'webdriverio tests need to be updated to node 12'",
     "start": "npm run clean && cross-env NODE_ENV=development L10N_DEV=true BASE_URL=http://localhost:8080 DETECT_BASE_URL=true webpack-dev-server --mode=development",
+    "start:server": "npm start",
+    "start:server:25gb": "cross-env MAX_FILE_SIZE=26843545600 npm start",
+    "start:server:10gb": "cross-env MAX_FILE_SIZE=10737418240 npm start",
+    "start:server:5gb": "cross-env MAX_FILE_SIZE=5368709120 npm start",
     "android": "cross-env ANDROID=1 npm start",
     "prod": "node server/bin/prod.js"
   },
